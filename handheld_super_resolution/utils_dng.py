@@ -73,6 +73,11 @@ def load_dng_burst(burst_path):
         Path of the reference image.
 
     """
+    # MFT: the reference image is always the first image in the burst, it does not match the recommandations of the paper by 
+    # Hasinoff et al. "Burst photography for high dynamic range and low-light imaging on mobile cameras" (2016), where they
+    # recomment to choose as the sharpest frame in the burst subset, according to a simple metric based on gradients in the 
+    # green channel of the raw input, following a general strategy known as lucky imaging [Joshi and Cohen 2010].
+    # This fits well with the application in astrophotography, where lucky imaging is widely used.
     ref_id = 0
     raw_comp = []
 
