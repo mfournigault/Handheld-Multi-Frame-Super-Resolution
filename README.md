@@ -21,18 +21,36 @@ In the examples above and in our IPOL paper, we used the post-processing approac
 Check also our publicly available implementation of **Polyblur** in this [repo](https://github.com/teboli/polyblur) to sharpen the result you get with this super-resolution code.
 
 ## Get started
-First of all, install the requirements by running (PyTorch is solely used for the GPU-based FFT as there is none in Numba):
-```bash
-pip install -r requirements.txt
-```
+>⚠️ For windows users, we recommend to perform the install using WSL to avoid potential issues that can be encountered with numba (see issue [#48](https://github.com/Jamy-L/Handheld-Multi-Frame-Super-Resolution/issues/48)).
 
-(OPTIONAL) We have provided in `./data` the noise curve for the correction of the robustness ratio for the Google Pixel 4a camera by taking the affine noise coefficients from the EXIF tags, and subsequently run
+Start by creating a the following conda environment and activate it. Notice that numba can be tricky to install correctly, and you may need to adjust the `"cuda-version"` part based on your setup.
+```bash
+conda create -n handheld -y -c conda-forge -c pytorch \
+  python=3.9 numpy=1.26.4 \
+  numba-cuda "cuda-version=12" \
+  rawpy exifread scipy scikit-image opencv colour-demosaicing matplotlib tqdm
+conda activate handheld
+```
+You will need a cuda toolkit. Again, please adapt the cuda version:
+```
+conda install -c nvidia "cuda-toolkit=12.8"
+```
+Lastly, install pytorch (you need to ensure that the installed versio support cuda). This is a minimal example but may not work for everyone:
+```
+pip install torch
+```
+### Setting noise profile (OPTIONAL)
+Note that the latest releases of the code automatically run `fast_monte_carlo.py` everytime you launch the program, which basically computes the noise curves on-the-fly using a fast approximation. You can therefore ignore this section.
+
+We have provided in `./data` the noise curves for the correction of the robustness ratio for the Google Pixel 4a camera by taking the affine noise coefficients from the EXIF tags, and subsequently ran
 ```bash
 python monte_carlo_simulation.py
 ```
-Please replace `alpha` and `beta` with the coefficients of your camera, and run the MC simulator to generate the correction curves at several ISO levels tailored for you specific device. Our curves may work for you camera but it might be sub-optimal as the noise models of the Google Pixel 4a camera and yours may diverge.
+If you want to precompute your own curves taylored to your device, please replace `alpha` and `beta` in this script with the coefficients of your camera, and run the MC simulator to generate the correction curves at several ISO levels tailored for you specific device. Our curves may work for you camera but it might be sub-optimal as the noise models of the Google Pixel 4a camera and yours may diverge.
 
-Last, download and unzip the test burst from [here](https://drive.google.com/file/d/1ot0E6guY5AacM-I6-GffHqFzykVb22wV/view?usp=share_link) and put it in the `./test_burst/` folder (it is a zipped folder containing 13 raw images originally from [here](https://github.com/goutamgmb/deep-rep)), or download the latest release of the code already containing test bursts. Now, simply run the code for x2 super-resolution with:
+
+### Running the code
+Place your .dng image burst in the `./test_burst/` folder. You can download some dng bursts [here](https://github.com/goutamgmb/deep-rep), or download the latest release of the code already containing test bursts. Now, simply run the code for x2 super-resolution with:
 ```
 python run_handheld.py --impath test_burst --outpath output.png
 ```
@@ -40,20 +58,24 @@ python run_handheld.py --impath test_burst --outpath output.png
 You can also use the following canvas in your own scripts:
 ```python
 from handeld_super_resolution import process
+from omegaconf import OmegaConf
 
-# Set the verbose level.
-options = {'verbose': 1}
+# Load the default configuration
+default_conf = OmegaConf.load("configs/default.yaml")
 
-# Specify the scale (1 is demosaicking), the merging kernel, and if you want to postprocess the final image.
-params = {
-  "scale": 2,  # choose between 1 and 2 in practice.
-  "merging": {"kernel": "handheld"},  # keep unchanged.
-  "post processing": {"on": True}  # set it to False if you want to use your own ISP.
-  }
+# Set your config like that.
+my_custom_conf = OmegaConf.create({
+    "scale": 2,
+})
+# Alternatively, put this custom conf in a yaml file and load it with:
+# my_custom_conf = OmegaConf.load("path_to_your_custom_config.yaml")
 
-# Run the algorithm.
-burst_path = 'path/to/folder/containing/raw/files'
-output_img = process(burst_path, options, params)
+# Merge user config over the default config
+config = OmegaConf.merge(default_conf, my_custom_conf)
+
+# calling the pipeline
+burst_path = './test_burst/Samsung/'
+output_img = process(burst_path, config)[0]
 ```
 
 The core of the algorithm is in `handheld_super_resolution.process(burst_path, options, params)` where :
@@ -68,31 +90,62 @@ To obtain the bursts used in the publication, please download the latest release
 ## Generating DNG
 
 Saving images as DNG requires extra-dependencies and steps:
-1. Install imageio using pip:
+### 1. Install imageio using pip:
 
     ```bash
     pip install imageio
     ```
 
-2. Install exiftool. You can download the appropriate version for your operating system from the [exiftool website](https://exiftool.org/).
+### 2. Install exiftool. On linux:
+```
+sudo apt update
+sudo apt install -y libimage-exiftool-perl
+exiftool -ver  # Should show version 12.40 or higher
+```
+You can download the appropriate version for your operating system from the [exiftool website](https://exiftool.org/).
 
-3. Download the DNG SDK from the [Adobe website](https://helpx.adobe.com/camera-raw/digital-negative.html#dng_sdk_download).
+### 3. Compile dng_validate (Adobe DNG SDK)
+The `dng_validate` tool is required to finalize DNG files. Adobe provides source code but no longer pre-compiled binaries.
+You need build dependencies:
+```
+sudo apt install -y build-essential gcc g++ make unzip libjpeg-dev
+```
+We will compile using the community makefile from a`bworrall/go-dng` which provides Linux build support:
+```
+cd ~/projects  # or your preferred location
 
-4. Follow the instructions in the `DNG_ReadMe.txt` file included in the downloaded DNG SDK to complete the installation.
+# Download DNG SDK with community makefile
+git clone https://github.com/abworrall/go-dng.git
+cd go-dng/sdk
+```
+Before compiling, we need to disable JPEG thumbnails, that doesn't work for big images and would prevent from generating them (we get the "No JPEG encoder" error. If you have another solution, please open an issue).
+#### Patch the source code
+During compilation, the normal process would be to unzip `dng_sdk_1_6.zip` and compile. We need to manually unzip, change a line in the source, then compile with the modified source.
+```
+cd go-dng/sdk
+unzip dng_sdk_1_6.zip
+cd dng_sdk/source
 
-5. Set the paths to the exiftool and DNG validate executables in the `utils_dng.py` script. Open the `utils_dng.py` file located in the project directory, and modify the values of the `EXIFTOOL_PATH` and `DNG_VALIDATE_PATH` variables to match the paths to the exiftool and DNG validate executables on your system.
+# Edit dng_validate.cpp line 401
+# Change: for (uint32 previewIndex = 0; previewIndex < 2; previewIndex++)
+# To:     for (uint32 previewIndex = 0; previewIndex < 0; previewIndex++)
 
-    ```python
-    # utils_dng.py
+# Using sed:
+sed -i 's/previewIndex < 2/previewIndex < 0/' dng_validate.cpp
 
-    # Set the path to the exiftool executable
-    EXIFTOOL_PATH = "/path/to/exiftool"
+cd ../../
+```
 
-    # Set the path to the DNG validate executable
-    DNG_VALIDATE_PATH = "/path/to/dng_validate"
-    ```
+We can now compile
 
-    Note that you may need to adjust the paths based on the location where you installed exiftool and DNG validate on your system.
+```
+# Compile dng_validate
+make CC=g++ CXX=g++ # Use system compiler, and not conda's (to use apt installed packages)
+# Say NO when prompted to replace the dezipped files
+# Verify compilation
+ls -lh bin/dng_validate  # Should show ~25MB binary
+./bin/dng_validate        # Should show usage information
+```
 
 That's it! Once you've completed these steps you should be able to save the output as DNG, for example by running:
 ```
@@ -120,53 +173,93 @@ If this code or the implementation details of the companion IPOL publication are
 }
 ```
 
+## Parameters
+All the settings of the algorithm are tweakable. They are available in `configs/default.yaml` that is detailed below. If you want to use a different value for one of these settings, you can set it in a `custom.yaml` and run
+```
+python run_handheld.py --impath test_burst --outpath output.png --config custom.yaml
+```
+
+Alternatively, you can directly indicate it without yaml with the syntax:
+```
+python run_handheld.py --impath test_burst --outpath output.png scale=2 noise_model.alpha=0.0000123
+```
+
+```yaml
+scale: 1 # The upscaling factor, can be floating but should remain bewteen 1 and 3.
+mode: bayer # bayer or grey ; the pipeline can processe grey or color image.
+debug: false # If turned on, other debug informations can be returned
+verbose: 1 
+grey_method: FFT # The method to estimate grey images from raw
+noise_model: # You can specify alpha and beta here. If left empty, they will be read from the dng metadata
+  alpha: 
+  beta:
+
+block_matching:
+  tuning:
+    # Defined fine-to-coarse
+    factors: [1, 2, 4, 4] # the downsample factor between each scale
+    tile_size: "SNR_based" # The tile size (for the finest scale). You can also give an int here
+    tile_size_factors: [1, 1, 1, 0.5] # How the tile size shape evloves at each scale
+    search_radii: [1, 4, 4, 4] # The search radius for block matching
+    metrics: ['L1', 'L2', 'L2', 'L2'] # The metric to minimize during search at each scale
+    flow_upscale_mode: nearest  # How to upscale the optical flow when the number of patches increases between two pyramid scales. nearest, bilinear, bicubic
+
+ica:
+  tuning:
+    n_iter: 3 # Number of ICA iterations
+    sigma_blur: 0 # If > 0 a gaussian blur will be applied before compute the gradients for the hessian
+
+robustness:
+  enabled: true # enable or disable the robustness mask
+  save_mask: true # Save or not the accumulated robustness mask as a .png
+  tuning: # The threshold paramters described in the article
+    t: 0.12
+    s1: 2
+    s2: 12
+    Mt: 0.8
+
+merging:
+  kernel: steerable # iso or steerable. The sahpe of the kernel
+  selection_law: linear # options: hard_threshold, linear. How to compute k1 and k2 from A, k_strech and k_shrink. hard threshold sets k1=k2 if A < 1.95, else steerable. Linear is the original version with a linear stretch.
+  tuning: # The kernel settings
+    k_detail: SNR_based
+    k_denoise: SNR_based
+    D_th: SNR_based
+    D_tr: SNR_based
+    k_stretch: 4
+    k_shrink: 2
+
+postprocessing:
+  enabled: true
+  do_color_correction: true # Apply the color matrix to convert from camera space to sRGB space
+  do_gamma_correction: true # Apply gamma correction (sRGB)
+  do_tonemapping: false # Apply tonemapping (Reinhard)
+  sharpening:
+    enabled: true
+    amount: 1.5
+    radius: 3
+  do_devignetting: false
+
+accumulated_robustness_denoiser: # These are the accumulated robustness denoising options
+  median:
+    enabled: False
+    radius_max: 3
+    max_frame_count: 8
+  gauss:
+    enabled: False
+    sigma_max: 1.5
+    max_frame_count: 8
+    
+  merge:
+    enabled: True
+    rad_max: 2
+    max_multiplier: 8 # Multiplier of the covariance for single frame SR
+    max_frame_count: 8 # # number of merged frames above which no blur is applied
+```
+
 ## Troubleshooting
 If you encounter any bug, please open an issue and/or sent an email at jamy.lafenetre@ens-paris-saclay.fr and thomas.eboli@ens-paris-saclay.fr.
 
-## Parameters
-The list of all the parameters, their default values and their relation to the SNR can be found in `params.py`. Here are a few of them, grouped by category :
-
-### General parameters
-|Parameter|usage|
-|--|--|
-|scale|The upscaling factor, can be floating but should remain bewteen 1 and 3.|
-|Ts|Tile size for the ICA algorithm, and the block matching. Is fixed by the SNR.|
-|mode|bayer or grey ; the pipeline can processe grey or color image.|
-|debug|If turned on, other debug informations can be returned|
-
-### Block matching
-|Parameter|usage|
-|--|--|
-|factors|list of the downsampling factor to generate the Guassian pyramid|
-|tileSize|list of the tileSizes during local search. The last stage should always be Ts !|
-|searchRadia|The search radius for each stage|
-|distances|L1 or L2; the norm to minimize at each stage|
-
-### ICA
-|Parameter|usage|
-|--|--|
-|kanadeIter|Number of iterations of the ICA algorithm|
-|sigma blur|Std of the Gausian filter applied to the grey image before computing gradient. If 0, no filter is applied|
-
-### Robustness
-|Parameter|usage|
-|--|--|
-|on|Whether the robustness is activated or not|
-|t||
-|s1||
-|s2||
-|Mt||
-
-### Merging
-|Parameter|usage|
-|--|--|
-|kernel|handheld or iso; whether to use the steerable kernels or the isotropic constant ones (Experiment 3.5in the IPOL article)|
-|k_detail||
-|k_denoise||
-|D_tr||
-|D_th||
-|k_shrink||
-|k_stretch||
 
 ### Others
 The default floating number representation and the default threads per block number can be modified in <code>utils.py</code>.
@@ -176,4 +269,3 @@ The default floating number representation and the default threads per block num
 
 ### Known Issues
 - The threshold functions and all the hyper-parameters mentionned in the IPOL article have only been partially tweaked : better results are expected with an in depth optimization.
-- For images whose estimated SNR is under 14, the tile size should be 64 but the block matching module cannot handle that.

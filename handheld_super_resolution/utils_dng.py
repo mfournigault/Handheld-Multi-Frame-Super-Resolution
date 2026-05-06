@@ -7,6 +7,7 @@ Created on Tue Mar 21 16:44:36 2023
 
 import os
 import glob
+import subprocess
 
 import numpy as np
 from pathlib import Path
@@ -19,8 +20,8 @@ from . import raw2rgb
 from .utils import DEFAULT_NUMPY_FLOAT_TYPE
 
 # Paths of exiftool and dng validate. Only necessary to output dng.
-EXIFTOOL_PATH = 'path/to/exiftool.exe'
-DNG_VALIDATE_PATH = 'path/to/dng_validate.exe'
+EXIFTOOL_PATH = 'exiftool' # Assumes exiftool is in PATH, but you can also paste the path here
+DNG_VALIDATE_PATH = 'dng_validate' # Same applies here
 
 
 # See "PhotometricInterpretation in" https://exiftool.org/TagNames/EXIF.html
@@ -147,35 +148,25 @@ def load_dng_burst(burst_path):
     ISO = min(3200, ISO)
 
 
+    #### Performing whitebalance
+    assert (type_ := type(ref_raw[0, 0])) == (y := type(raw_comp[0, 0, 0])), f'Reference and comp images should have the same data type, got {type_} and {y}.'
 
 
-    #### Performing whitebalance and normalizing into 0, 1
-
-    if np.issubdtype(type(ref_raw[0, 0]), np.integer):
-        # Here do black and white level correction and white balance processing for all image in comp_images
-        # Each image in comp_images should be between 0 and 1.
-        # ref_raw is a (H,W) array
+    if np.issubdtype(type_, np.integer):
         ref_raw = ref_raw.astype(DEFAULT_NUMPY_FLOAT_TYPE)
+        raw_comp = raw_comp.astype(DEFAULT_NUMPY_FLOAT_TYPE)
         for i in range(2):
             for j in range(2):
                 channel = CFA[i, j]
+                k = white_balance[channel] / white_balance[1]
                 ref_raw[i::2, j::2] = (ref_raw[i::2, j::2] - black_levels[channel]) / (white_level - black_levels[channel])
-                ref_raw[i::2, j::2] *= white_balance[channel] / white_balance[1]
-
-        ref_raw = np.clip(ref_raw, 0.0, 1.0)
-        # The division by the green WB value is important because WB may come with integer coefficients instead
-
-    if np.issubdtype(type(raw_comp[0, 0, 0]), np.integer):
-        raw_comp = raw_comp.astype(DEFAULT_NUMPY_FLOAT_TYPE)
-        # raw_comp is a (N, H,W) array
-        for i in range(2):
-            for j in range(2):
-                channel = channel = CFA[i, j]
                 raw_comp[:, i::2, j::2] = (raw_comp[:, i::2, j::2] - black_levels[channel]) / (white_level - black_levels[channel])
-                raw_comp[:, i::2, j::2] *= white_balance[channel] / white_balance[1]
-        raw_comp = np.clip(raw_comp, 0., 1.)
+                ref_raw[i::2, j::2] *= k
+                raw_comp[:, i::2, j::2] *= k
+    else:
+        warnings.warn('Input DNG images are not in integer format: is the input valid RAW data?')
 
-    return ref_raw, raw_comp, ISO, tags, CFA, xyz2cam, raw_path_list[ref_id]
+    return ref_raw, raw_comp, ISO, tags, CFA, xyz2cam, white_balance, raw_path_list[ref_id]
 
 
 def save_as_dng(np_img, ref_dng_path, outpath):
@@ -211,31 +202,22 @@ def save_as_dng(np_img, ref_dng_path, outpath):
     None.
 
     '''
-    assert np_img.shape[-1] == 3
+    assert np_img.ndim == 3 and np_img.shape[-1] == 3, f"Got {np_img.shape}, expected HxWx3 RGB image."
 
     np_int_img = np.copy(np_img)  # copying to avoid inplace-overwritting
-    #### Undo White balance and black level
-    # get tags
-    with open(ref_dng_path, 'rb') as raw_file:
-        tags = exifread.process_file(raw_file)
-
-    black_levels = tags['Image BlackLevel']
-    if isinstance(black_levels.values[0], int):
-        black_levels = np.array(black_levels.values)
-    else:  # Sometimes this tag is a fraction object for some reason. It seems that black levels are all integers anyway
-        black_levels = np.array([int(x.decimal()) for x in black_levels.values])
 
     raw = rawpy.imread(ref_dng_path)
     white_balance = raw.camera_whitebalance
+    white_balance = [x/white_balance[1] for x in white_balance]  # Normalize to green channel
 
-    # Reverse WB
+    # Quantize to 16 bits using full range
     new_white_level = 2**16 - 1
+    new_black_level = 0
 
-    for c in range(3):
-        np_int_img[:, :, c] /= white_balance[c] / white_balance[1]
-        np_int_img[:, :, c] = np_int_img[:, :, c] * (new_white_level - black_levels[c]) + black_levels[c]
+    np_int_img = np_int_img * (new_white_level - new_black_level) + new_black_level
+    np_int_img = np.round(np_int_img)
 
-    np_int_img = np.clip(np_int_img, 0, 2**16 - 1).astype(np.uint16)
+    np_int_img = np.clip(np_int_img, 0, new_white_level).astype(np.uint16)
 
     #### Saving the image as 16 bits RGB tiff
     save_as_tiff(np_int_img, outpath)
@@ -248,55 +230,101 @@ def save_as_dng(np_img, ref_dng_path, outpath):
 
     #### Overwritting the tiff tags with dng tags, and replacing the .tif extension
     # by .dng
-    cmd = '''
-        {} -n\
-        -IFD0:SubfileType#=0\
-        -IFD0:PhotometricInterpretation#=34892\
-        -SamplesPerPixel#=3\
-        -overwrite_original -tagsfromfile {}\
-        "-all:all>all:all"\
-        -DNGVersion\
-        -DNGBackwardVersion\
-        -ColorMatrix1 -ColorMatrix2\
-        "-IFD0:BlackLevelRepeatDim<SubIFD:BlackLevelRepeatDim"\
-        "-IFD0:CalibrationIlluminant1<SubIFD:CalibrationIlluminant1"\
-        "-IFD0:CalibrationIlluminant2<SubIFD:CalibrationIlluminant2"\
-        "-IFD0:CFARepeatPatternDim<SubIFD:CFARepeatPatternDim"\
-        "-IFD0:CFAPattern2<SubIFD:CFAPattern2"\
-        -AsShotNeutral\
-        "-IFD0:ActiveArea<SubIFD:ActiveArea"\
-        "-IFD0:DefaultScale<SubIFD:DefaultScale"\
-        "-IFD0:DefaultCropOrigin<SubIFD:DefaultCropOrigin"\
-        "-IFD0:DefaultCropSize<SubIFD:DefaultCropSize"\
-        "-IFD0:OpcodeList1<SubIFD:OpcodeList1"\
-        "-IFD0:OpcodeList2<SubIFD:OpcodeList2"\
-        "-IFD0:OpcodeList3<SubIFD:OpcodeList3"\
-         -o {} {}
-        '''.format(EXIFTOOL_PATH, ref_dng_path,
-                   tmp_path.as_posix(),
-                   outpath.with_suffix('.tif').as_posix())
-    os.system(cmd)
+    cmd = [
+        EXIFTOOL_PATH,
+        "-n",
+        "-IFD0:SubfileType#=0",
+        # "-DNGBackwardVersion=1 2 0 0"
+        "-IFD0:PhotometricInterpretation#=34892",
+        "-BaselineExposure=0",
+        "-SamplesPerPixel#=3",
+        "-overwrite_original",
+        "-tagsfromfile", ref_dng_path,
+        "-all:all>all:all",
+        "-DNGVersion",
+        "-DNGBackwardVersion",
+        "-ColorMatrix1",
+        "-ColorMatrix2",
+        "-IFD0:CalibrationIlluminant1<SubIFD:CalibrationIlluminant1",
+        "-IFD0:CalibrationIlluminant2<SubIFD:CalibrationIlluminant2",
+        f"-AsShotNeutral=1 1 1",
+        # "-IFD0:BlackLevelRepeatDim<SubIFD:BlackLevelRepeatDim",
+        # "-IFD0:CFARepeatPatternDim<SubIFD:CFARepeatPatternDim",
+        # "-IFD0:CFAPattern2<SubIFD:CFAPattern2",
+        # "-IFD0:ActiveArea<SubIFD:ActiveArea",
+        # "-IFD0:DefaultScale<SubIFD:DefaultScale",
+        # "-IFD0:DefaultCropOrigin<SubIFD:DefaultCropOrigin",
+        # "-IFD0:DefaultCropSize<SubIFD:DefaultCropSize",
+        "-IFD0:OpcodeList1<SubIFD:OpcodeList1",
+        "-IFD0:OpcodeList2<SubIFD:OpcodeList2",
+        "-IFD0:OpcodeList3<SubIFD:OpcodeList3",
+        "-o", tmp_path.as_posix(),
+        outpath.with_suffix('.tif').as_posix()
+    ]
 
-    # adding further dng tags
-    cmd = """
-        {} -n -overwrite_original -tagsfromfile {}\
-        "-IFD0:AnalogBalance"\
-        "-IFD0:ColorMatrix1" "-IFD0:ColorMatrix2"\
-        "-IFD0:CameraCalibration1" "-IFD0:CameraCalibration2"\
-        "-IFD0:AsShotNeutral" "-IFD0:BaselineExposure"\
-        "-IFD0:CalibrationIlluminant1" "-IFD0:CalibrationIlluminant2"\
-        "-IFD0:ForwardMatrix1" "-IFD0:ForwardMatrix2"\
-        {}\
-        """.format(EXIFTOOL_PATH, ref_dng_path, tmp_path.as_posix())
-    os.system(cmd)
+    # Run the command safely
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ExifTool command failed: {result.stderr}")
+    else:
+        print("ExifTool succeeded")
+        print(result.stdout)
+
+    # Adding further tags that cant be set during first run (because it was a .tiff and now it's a .dng)
+    exiftool_args = [
+        EXIFTOOL_PATH,
+        "-n",
+        "-overwrite_original",
+        "-tagsfromfile", ref_dng_path,
+        f"-IFD0:AnalogBalance={white_balance[0]} {white_balance[1]} {white_balance[2]}",
+        f"-AnalogBalance={white_balance[0]} {white_balance[1]} {white_balance[2]}",
+        "-AsShotWhiteXY=",
+        "-BlackLevelDeltaH=",
+        "-BlackLevelDeltaV=",
+        "-XMP:ColorTemperature=",
+        "-IFD0:ColorMatrix1",
+        "-IFD0:ColorMatrix2",
+        "-IFD0:CameraCalibration1",
+        "-IFD0:CameraCalibration2",
+        "-IFD0:ProfileHueSatMap1",
+        "-IFD0:ProfileHueSatMap2",
+        "-IFD0:ProfileLookTable"
+        f"-IFD0:AsShotNeutral=1 1 1",
+        f"-AsShotNeutral=1 1 1",
+        f"-IFD0:WhiteLevel={new_white_level} {new_white_level} {new_white_level}",
+        f"-IFD0:BlackLevel={new_black_level} {new_black_level} {new_black_level}",
+        f"-BlackLevel={new_black_level} {new_black_level} {new_black_level}",
+        f"-WhiteLevel={new_white_level} {new_white_level} {new_white_level}",
+        "-IFD0:BaselineExposure",
+        "-IFD0:CalibrationIlluminant1",
+        "-IFD0:CalibrationIlluminant2",
+        "-IFD0:ForwardMatrix1",
+        "-IFD0:ForwardMatrix2",
+        tmp_path.as_posix(),
+    ]
+
+    result = subprocess.run(exiftool_args, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ExifTool failed:\n{result.stderr}")
+    else:
+        print(result.stdout)
 
     # Running DNG_validate
-    cmd = """
-    {} -16 -dng\
-    {}\
-    {}\
-    """.format(DNG_VALIDATE_PATH, outpath.with_suffix('.dng').as_posix(), tmp_path.as_posix())
-    os.system(cmd)
+    cmd = [
+        DNG_VALIDATE_PATH,
+        "-16",
+        "-dng",
+        outpath.with_suffix(".dng").as_posix(),
+        tmp_path.as_posix(),
+    ]
+
+    # Use Popen to stream output in real-time
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
+        for line in proc.stdout:
+            print(line, end="")  # print each line as it arrives
+        proc.wait()  # wait for completion
+        if proc.returncode != 0:
+            raise RuntimeError(f"DNG_validate failed with return code {proc.returncode}")
 
     os.remove(tmp_path)
 
@@ -305,4 +333,14 @@ def save_as_tiff(int_im, outpath):
     # 16 bits uncompressed by default
     # Imageio is the only module I could find to save 16 bits RGB tiffs without compression (cv2 does LZW).
     # It is vital to have uncompressed image, because validate_dng cannot work if the tiff is compressed.
-    imageio.imwrite(outpath.with_suffix('.tif').as_posix(), int_im, bigtiff=False)
+    try:
+        # Try to write as classic TIFF
+        with imageio.imopen(outpath.with_suffix('.tif').as_posix(), 'w', bigtiff=False) as img_file: # Cant put bigtiff=True, else exiftool wont work to write tags...
+            img_file.write(int_im)
+    except ValueError as e:
+        # ImageIO raises ValueError if data too large for classic TIFF (> 4GB)
+        raise RuntimeError(
+            f"Failed to write '{outpath.name}' as a classic TIFF. "
+            f"The image is too large for bigtiff=False. "
+            f"Raise an issue on github if you need support for bigtiff."
+        ) from e

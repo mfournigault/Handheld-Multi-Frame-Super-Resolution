@@ -22,7 +22,11 @@ from .utils import clamp, DEFAULT_CUDA_FLOAT_TYPE, DEFAULT_NUMPY_FLOAT_TYPE, DEF
 from .utils_image import compute_grey_images, GAT
 
 
-def estimate_kernels(img, options, params):
+SEL_HARD_THRESHOLD = 0
+SEL_LINEAR = 1
+
+
+def estimate_kernels(img, config):
     """
     Implementation of Alg. 5: ComputeKernelCovariance
     Returns the kernels covariance matrices for the frame J_n, sampled at the
@@ -35,13 +39,8 @@ def estimate_kernels(img, options, params):
         Raw image J_n
     options : dict
         options
-    params : dict
-        params['mode'] : {"bayer", "grey"}
-            Wether the burst is raw or grey
-        params['tuning'] : dict
-            parameters driving the kernel shape
-        params['noise'] : dict
-            cointain noise model informations
+    config : OmegaConf object
+        parameters.
 
     Returns
     -------
@@ -49,22 +48,29 @@ def estimate_kernels(img, options, params):
         Covariance matrices Omega_n, sampled at the center of each bayer quad.
 
     """    
-    bayer_mode = params['mode']=='bayer'
-    verbose_3 = options['verbose'] >= 3
-    
+    bayer_mode = config.mode=='bayer'
+    verbose_3 = config.verbose >= 3
+
     GAT_ = timer(GAT, verbose_3, end_s="- Variance Stabilized")
     compute_grey_images_ = timer(compute_grey_images, verbose_3, end_s="- Decimated Image")
+
+    k_detail = config.merging.tuning.k_detail
+    k_denoise = config.merging.tuning.k_denoise
+    D_th = config.merging.tuning.D_th
+    D_tr = config.merging.tuning.D_tr
+    k_stretch = config.merging.tuning.k_stretch
+    k_shrink = config.merging.tuning.k_shrink
     
-    k_detail = params['tuning']['k_detail']
-    k_denoise = params['tuning']['k_denoise']
-    D_th = params['tuning']['D_th']
-    D_tr = params['tuning']['D_tr']
-    k_stretch = params['tuning']['k_stretch']
-    k_shrink = params['tuning']['k_shrink']
-    
-    alpha = params['noise']['alpha']
-    beta = params['noise']['beta']
-    
+    if config.merging.selection_law == 'hard_threshold':
+        selection_law = SEL_HARD_THRESHOLD
+    elif config.merging.selection_law == 'linear':
+        selection_law = SEL_LINEAR
+    else:
+        raise ValueError(f"Unknown selection law: {config.merging.selection_law}")
+
+    alpha = config.noise_model.alpha
+    beta = config.noise_model.beta
+
     if verbose_3:
         cuda.synchronize()
         t1 = time.perf_counter()
@@ -122,7 +128,7 @@ def estimate_kernels(img, options, params):
     
     cuda_estimate_kernel[blockspergrid, threadsperblock](cuda_full_grads,
                                     k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink,
-                                    covs)  
+                                    covs, selection_law)  
     if verbose_3:
         cuda.synchronize()
         t1 = getTime(t1, "- Covariances estimated")
@@ -134,7 +140,8 @@ def cuda_estimate_kernel(full_grads,
                          k_detail, k_denoise,
                          D_th, D_tr,
                          k_stretch, k_shrink,
-                         covs):
+                         covs,
+                         selection_law):
     pixel_idx, pixel_idy = cuda.grid(2)
     imshape_y, imshape_x, _, _ = covs.shape
 
@@ -173,7 +180,7 @@ def cuda_estimate_kernel(full_grads,
     get_eigen_elmts_2x2(structure_tensor, l, e1, e2)
 
     compute_k(l[0], l[1], k, k_detail, k_denoise, D_th, D_tr, k_stretch,
-    k_shrink)
+    k_shrink, selection_law)
 
     k_1_sq = k[0]*k[0]
     k_2_sq = k[1]*k[1]
@@ -185,8 +192,7 @@ def cuda_estimate_kernel(full_grads,
 
     
 @cuda.jit(device=True)
-def compute_k(l1, l2, k, k_detail, k_denoise, D_th, D_tr, k_stretch,
-                          k_shrink):
+def compute_k(l1, l2, k, k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink, selection_law):
     """
     Computes k_1 and k_2 based on lambda1, lambda2 and the constants.
 
@@ -212,15 +218,27 @@ def compute_k(l1, l2, k, k_detail, k_denoise, D_th, D_tr, k_stretch,
     A = 1 + math.sqrt((l1 - l2)/(l1 + l2))
     D = clamp(1 - math.sqrt(l1)/D_tr + D_th, 0, 1)
 
-    # This is a very agressive way of driving anisotropy, but it works well so far.
+    if selection_law == SEL_HARD_THRESHOLD:
+        k1, k2 = hard_threshold(A, k_shrink, k_stretch)
+    else: # LINEAR
+        k1, k2 = linear(A, k_shrink, k_stretch)
+    
+    k[0] = k_detail * ((1-D)*k1 + D*k_denoise)
+    k[1] = k_detail * ((1-D)*k2 + D*k_denoise)
+
+@cuda.jit(device=True)
+def hard_threshold(A, k_shrink, k_stretch):
     if A > 1.95:
         k1 = 1/k_shrink
         k2 = k_stretch
     else: # When A is Nan, we fall back to this condition
         k1 = 1
         k2 = 1
-    
-    k[0] = k_detail * ((1-D)*k1 + D*k_denoise)
-    k[1] = k_detail * ((1-D)*k2 + D*k_denoise)
+    return k1, k2
 
+@cuda.jit(device=True)
+def linear(A, k_shrink, k_stretch):
+    k1 = 1 + A/2 * (1/k_shrink - 1)
+    k2 = 1 + A/2 * (k_stretch - 1)
+    return k1, k2
 
