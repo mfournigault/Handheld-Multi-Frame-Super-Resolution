@@ -242,7 +242,7 @@ def process(burst_path, config):
     currentTime, verbose_1, verbose_2 = (time.perf_counter(),
                                          config.verbose >= 1,
                                          config.verbose >= 2)
-    
+    verbose_3 = config.verbose >= 3
     if verbose_3:
         print("[progress] Loading DNG burst", flush=True)
     # reading image stack
