@@ -99,18 +99,24 @@ def main(ref_img, comp_imgs, config):
     cuda_diff_curve = cuda.to_device(np.array(config.noise_model.diff_curve))
     
     if verbose :
-        print("\nProcessing reference image ---------\n")
+        print("\nProcessing reference image ---------\n", flush=True)
         t1 = time.perf_counter()
 
     #### Raw to grey
+    if verbose_3:
+        print("[progress] Estimating reference grey image", flush=True)
     if bayer_mode :
         cuda_ref_grey = compute_grey_images_(cuda_ref_img, grey_method)
     else:
         cuda_ref_grey = cuda_ref_img
 
+    if verbose_3:
+        print("[progress] Initializing alignment", flush=True)
     ref_pyramid, tyled_pyr, ref_tiled_fft, ref_gradx, ref_grady, ref_hessian = init_alignment_(cuda_ref_grey, config)
 
     #### Local stats estimation
+    if verbose_3:
+        print("[progress] Estimating reference local statistics", flush=True)
     ref_local_means, ref_local_stds = init_robustness_(cuda_ref_img, cfa_pattern, white_balance, config)
 
     if accumulate_r:
@@ -133,7 +139,7 @@ def main(ref_img, comp_imgs, config):
     for im_id in range(n_images):
         if verbose :
             cuda.synchronize()
-            print("\nProcessing image {} ---------\n".format(im_id+1))
+            print("\nProcessing image {} ---------\n".format(im_id+1), flush=True)
             im_time = time.perf_counter()
         
         #### Moving to GPU
@@ -141,11 +147,15 @@ def main(ref_img, comp_imgs, config):
         cuda.to_device(comp_imgs[im_id], to=cuda_img, stream=stream)
         
         #### Compute Grey Images
+        if verbose_3:
+            print("[progress] Frame {}: estimating grey image".format(im_id+1), flush=True)
         if bayer_mode:
             cuda_im_grey = compute_grey_images(comp_imgs[im_id], grey_method)
         else:
             cuda_im_grey = cuda_img
         
+        if verbose_3:
+            print("[progress] Frame {}: aligning".format(im_id+1), flush=True)
         cuda_final_alignment = align_(ref_pyramid, tyled_pyr, ref_tiled_fft, ref_gradx, ref_grady, ref_hessian,
                         cuda_im_grey, config)
         
@@ -153,15 +163,21 @@ def main(ref_img, comp_imgs, config):
             debug_dict["flow"].append(cuda_final_alignment.copy_to_host())
             
         #### Robustness
+        if verbose_3:
+            print("[progress] Frame {}: estimating robustness".format(im_id+1), flush=True)
         cuda_robustness = compute_robustness_(cuda_img, ref_local_means, ref_local_stds, cuda_final_alignment,
                                             cfa_pattern, white_balance, (cuda_std_curve, cuda_diff_curve), config)
         if accumulate_r:
             add(accumulated_r, cuda_robustness)
         
         #### Kernel estimation
+        if verbose_3:
+            print("[progress] Frame {}: estimating kernels".format(im_id+1), flush=True)
         cuda_kernels = estimate_kernels_(cuda_img, config)
         
         #### Merging
+        if verbose_3:
+            print("[progress] Frame {}: merging".format(im_id+1), flush=True)
         merge_(cuda_img, cuda_final_alignment, cuda_kernels, cuda_robustness, num, den, cfa_pattern, config)
         
         if verbose :
@@ -173,9 +189,13 @@ def main(ref_img, comp_imgs, config):
         stream.synchronize()
     
     #### Ref kernel estimation
+    if verbose_3:
+        print("[progress] Estimating reference kernels", flush=True)
     cuda_kernels = estimate_kernels_(cuda_ref_img, config)
     
     #### Merge ref
+    if verbose_3:
+        print("[progress] Merging reference image", flush=True)
     if accumulate_r:     
         merge_ref_(cuda_ref_img, cuda_kernels,
                    num, den, cfa_pattern,
@@ -188,11 +208,13 @@ def main(ref_img, comp_imgs, config):
 
         
     # num is outwritten into num/den
+    if verbose_3:
+        print("[progress] Normalizing output image", flush=True)
     divide_(num, den)
     
     if verbose :
         s = '\nTotal ellapsed time : '
-        print(s, ' ' * (50 - len(s)), ': ', round((time.perf_counter() - t1), 2), 'seconds')
+        print(s, ' ' * (50 - len(s)), ': ', round((time.perf_counter() - t1), 2), 'seconds', flush=True)
     
     if accumulate_r :
         debug_dict['accumulated robustness'] = accumulated_r
@@ -221,12 +243,14 @@ def process(burst_path, config):
                                          config.verbose >= 1,
                                          config.verbose >= 2)
     
+    if verbose_3:
+        print("[progress] Loading DNG burst", flush=True)
     # reading image stack
     ref_raw, raw_comp, ISO, tags, CFA, xyz2cam, white_balance, ref_path = load_dng_burst(burst_path)
     
     if config.noise_model.get("alpha", None) is not None:
         # User provided custom values.
-        print("Using user provided alpha and beta values")
+        print("Using user provided alpha and beta values", flush=True)
         alpha = config.noise_model.alpha
         beta = config.noise_model.beta
     ## The noise model exif are already scaled for the image ISO.
@@ -250,6 +274,8 @@ def process(burst_path, config):
     # std_curve = np.load(std_noise_model_path)
     # diff_curve = np.load(diff_noise_model_path)
     
+    if verbose_3:
+        print("[progress] Estimating noise curves", flush=True)
     # Use this to compute noise curves on the fly
     std_curve, diff_curve = run_fast_MC(alpha, beta)
     
@@ -258,6 +284,8 @@ def process(burst_path, config):
         currentTime = getTime(currentTime, ' -- Read raw files')
 
     #### Estimating ref image SNR
+    if verbose_3:
+        print("[progress] Estimating reference SNR", flush=True)
     brightness = np.mean(ref_raw)
     
     id_noise = round(1000*brightness)
@@ -297,6 +325,8 @@ def process(burst_path, config):
     
     
     #### Running the handheld pipeline
+    if verbose_3:
+        print("[progress] Running super-resolution pipeline", flush=True)
     handheld_output, debug_dict = main(ref_raw.astype(DEFAULT_NUMPY_FLOAT_TYPE), raw_comp.astype(DEFAULT_NUMPY_FLOAT_TYPE), config)
     
     
@@ -311,12 +341,12 @@ def process(burst_path, config):
     post_processing_enabled = config.postprocessing.enabled
 
     if post_frame_count_denoise or post_processing_enabled:
-        if verbose_1:
-            print('Beginning post processing')
+        if verbose_3:
+            print('[progress] Beginning post processing', flush=True)
     
     if post_frame_count_denoise : 
         if verbose_2:
-            print('-- Robustness aware bluring')
+            print('-- Robustness aware bluring', flush=True)
         
         if median:
             handheld_output = frame_count_denoising_median(handheld_output, debug_dict['accumulated robustness'],
@@ -330,7 +360,7 @@ def process(burst_path, config):
     
     if post_processing_enabled:
         if verbose_2:
-            print('-- Post processing image')
+            print('-- Post processing image', flush=True)
         
         raw = rawpy.imread(ref_path)
         output_image = raw2rgb.postprocess(raw, handheld_output.copy_to_host(),
@@ -357,6 +387,8 @@ def process(burst_path, config):
     
     
     
+    if verbose_3:
+        print("[progress] Applying image orientation", flush=True)
     return output_image, debug_dict
 
     
